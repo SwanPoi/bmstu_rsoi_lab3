@@ -1,0 +1,75 @@
+version: "3"
+services:
+  postgres:
+    image: library/postgres:13
+    container_name: postgres
+    restart: on-failure
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "postgres"
+      POSTGRES_DB: postgres
+    volumes:
+      - db-test-data:/var/lib/postgresql/data
+      - ./postgres-test:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  
+  gateway:
+    image: swanpoi/gateway
+    container_name: gateway
+    restart: on-failure
+    build:
+      context: src/gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  cars:
+    image: swanpoi/car-service
+    container_name: car
+    restart: on-failure
+    build:
+      context: src/car
+      dockerfile: Dockerfile
+    ports:
+      - "8070:8070"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  rental:
+    image: swanpoi/rental-service
+    container_name: rental
+    restart: on-failure
+    build:
+      context: src/rental
+      dockerfile: Dockerfile
+    ports:
+      - "8060:8060"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  payment:
+    image: swanpoi/payment-service
+    container_name: payment
+    restart: on-failure
+    build:
+      context: src/payment
+      dockerfile: Dockerfile
+    ports:
+      - "8050:8050"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  db-test-data:
