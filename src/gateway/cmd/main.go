@@ -7,9 +7,13 @@ import (
 	"github.com/SwanPoi/bmstu_rsoi_lab2/src/gateway/models"
 	server "github.com/SwanPoi/bmstu_rsoi_lab2/src/gateway/server"
 	services "github.com/SwanPoi/bmstu_rsoi_lab2/src/gateway/services"
+	redis 	"github.com/SwanPoi/bmstu_rsoi_lab2/src/gateway/queue"
 )
 
 func main() {
+	redis.InitRedis()
+	redis.StartRetryWorker()
+	
 	services := services.NewServices()
 
 	handlerConfig := models.HandlerConfig{

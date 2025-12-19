@@ -34,12 +34,12 @@ jobs:
 
       - name: Build images
         timeout-minutes: 10
-        run: docker compose -f docker-compose.test.yml build
+        run: docker compose build
 
       - name: Run containers
         timeout-minutes: 5
         run: |
-          docker compose -f docker-compose.test.yml up -d
+          docker compose up -d
           ./scripts/wait-script.sh
         env:
           WAIT_PORTS: 8080,8070,8060,8050
@@ -65,8 +65,8 @@ jobs:
         run: ./scripts/test-script.sh
         env:
           VARIANT: v3
-          SERVICE_NAME: <your service name>
-          PORT_NUMBER: <port number>
+          SERVICE_NAME: payment
+          PORT_NUMBER: 8050
 
       - name: Stop containers
         if: always()

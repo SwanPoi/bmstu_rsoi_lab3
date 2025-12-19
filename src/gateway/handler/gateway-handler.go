@@ -7,9 +7,13 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/SwanPoi/bmstu_rsoi_lab2/src/gateway/converters"
 	"github.com/SwanPoi/bmstu_rsoi_lab2/src/gateway/models"
+	cb "github.com/SwanPoi/bmstu_rsoi_lab2/src/gateway/circuitBreaker"
+	queue "github.com/SwanPoi/bmstu_rsoi_lab2/src/gateway/queue"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -46,12 +50,98 @@ func forwardRequest(c *gin.Context, method, targetURL string, headers map[string
 	return resp.StatusCode, respBody, resp.Header, nil
 }
 
+// Функция forward с Circuit Breaker
+func (h *GatewayHandler) forwardRequestWithCB(
+	c *gin.Context,
+	method, targetURL string,
+	headers map[string]string,
+	body []byte,
+	cb *cb.CircuitBreaker,
+	isCritical bool,
+) (int, []byte, http.Header, error) {
+
+	if !cb.AllowRequest() {
+		if isCritical {
+			return 0, nil, nil, fmt.Errorf(targetURL + " is unavailable")
+		}
+
+		return http.StatusOK, []byte("{}"), nil, nil
+	}
+
+	if len(c.Request.URL.RawQuery) > 0 {
+		targetURL = fmt.Sprintf("%s?%s", targetURL, c.Request.URL.RawQuery)
+	}
+
+	req, err := http.NewRequest(method, targetURL, bytes.NewReader(body))
+	if err != nil {
+		cb.RecordFailure()
+		return 0, nil, nil, err
+	}
+
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	if c.Request.Header.Get("Content-Type") != "" {
+		req.Header.Set("Content-Type", c.Request.Header.Get("Content-Type"))
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		cb.RecordFailure()
+		return 0, nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		cb.RecordFailure()
+		return resp.StatusCode, nil, resp.Header, err
+	}
+
+	if resp.StatusCode >= 500 {
+		cb.RecordFailure()
+		if isCritical {
+			return resp.StatusCode, respBody, resp.Header, fmt.Errorf("service error: %d", resp.StatusCode)
+		}
+		return http.StatusOK, []byte("{}"), nil, nil
+	}
+
+	cb.RecordSuccess()
+	return resp.StatusCode, respBody, resp.Header, nil
+}
+
+// Rollbacks
+func (h *GatewayHandler) rollbackCarBooking(ctx *gin.Context, carUID string) {
+	carStatusUpsert := models.CarStatusUpsert{Availability: true}
+	carStatusBytes, _ := json.Marshal(carStatusUpsert)
+	forwardRequest(ctx, "PATCH", h.config.CarUrl + "/cars/" + carUID, nil, carStatusBytes)
+}
+
+func (h *GatewayHandler) rollbackPayment(ctx *gin.Context, paymentUID string) {
+	paymentStatusUpsert := models.PaymentUpsert{Status: "CANCELED"}
+	paymentStatusBytes, _ := json.Marshal(paymentStatusUpsert)
+	forwardRequest(ctx, "PATCH", h.config.PaymentUrl + "/payment/" + paymentUID, nil, paymentStatusBytes)
+}
+
+func (h *GatewayHandler) rollbackRental(ctx *gin.Context, rentalUID string, headers map[string]string) {
+	rentalStatusUpsert := models.RentalUpsert{Status: "CANCELED"}
+	rentalStatusBytes, _ := json.Marshal(rentalStatusUpsert)
+
+	rentalUrl := h.config.RentalUrl + "/rental/" + rentalUID
+	forwardRequest(ctx, "PATCH", rentalUrl, headers, rentalStatusBytes)
+}
+
+
+
+// Main functions
 func (h *GatewayHandler) GetCars(ctx *gin.Context) {
-	status, body, headers, err := forwardRequest(ctx, "GET", h.config.CarUrl + "/cars", nil, nil)
+	status, body, headers, err := h.forwardRequestWithCB(ctx, "GET", h.config.CarUrl + "/cars", nil, nil, h.carCB, true)
 
 	if err != nil {
 		log.Println("GET /cars, ", err.Error())
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{ Message: err.Error() })
+		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{ Message: "Car Service unavailable" })
 		return
 	}
 
@@ -69,11 +159,11 @@ func (h *GatewayHandler) GetUserRentals(ctx *gin.Context) {
 	headers := map[string]string{"X-User-Name": username}
 
 	// 1. Получить аренды
-	status, body, _, err := forwardRequest(ctx, "GET", h.config.RentalUrl + "/rental", headers, nil)
+	status, body, _, err := h.forwardRequestWithCB(ctx, "GET", h.config.RentalUrl + "/rental", headers, nil, h.rentalCB, true)
 
 	if err != nil {
 		log.Println("GET /rentals, can't get rentals", err.Error())
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
+		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: "Rental Service unavailable"})
 		return
 	}
 
@@ -101,24 +191,17 @@ func (h *GatewayHandler) GetUserRentals(ctx *gin.Context) {
 	carsRequest := models.CarsRequest{ UIDs: carUIDs }
 	carReqBody, _ := json.Marshal(carsRequest)
 
-	carStatus, carBody, _, err := forwardRequest(ctx, "POST", carUrl, nil, carReqBody)
+	carStatus, carBody, _, err := h.forwardRequestWithCB(ctx, "POST", carUrl, nil, carReqBody, h.carCB, false)
 	if err != nil {
 		log.Println("GET /rentals, can't get cars, ", err.Error())
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
-		return
-	}
-
-	if carStatus != http.StatusOK {
-		log.Println("GET /rentals, error while getting cars")
-		ctx.Data(carStatus, "application/json", carBody)
-		return
 	}
 
 	var cars []models.ShortCarResponse
-	if err := json.Unmarshal(carBody, &cars); err != nil {
-		log.Println("GET /rentals, car parsing error, ", err.Error())
-		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: "Car parsing error"})
-		return
+	if err == nil && carStatus == http.StatusOK && len(carBody) > 2 && string(carBody) != "{}" {
+		if err := json.Unmarshal(carBody, &cars); err != nil {
+			log.Println("GET /rentals, car parsing error, ", err.Error())
+			cars = nil // Будем использовать fallback
+		}
 	}
 	
 	// 3. Получить оплаты
@@ -126,41 +209,50 @@ func (h *GatewayHandler) GetUserRentals(ctx *gin.Context) {
 	paymentsRequest := models.PaymentsRequest{ UIDs: paymentUIDs }
 	paymentsReqBody, _ := json.Marshal(paymentsRequest)
 
-	paymentStatus, paymentBody, _, err := forwardRequest(ctx, "POST", paymentUrl, nil, paymentsReqBody)
+	paymentStatus, paymentBody, _, err := h.forwardRequestWithCB(ctx, "POST", paymentUrl, nil, paymentsReqBody, h.paymentCB, false)
 	if err != nil {
 		log.Println("GET /rentals, can't get payments, ", err.Error())
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
-		return
-	}
-
-	if paymentStatus != http.StatusOK {
-		log.Println("GET /rentals, payment getting error")
-		ctx.Data(paymentStatus, "application/json", paymentBody)
-		return
 	}
 
 	var payments []models.PaymentInfo
-	if err := json.Unmarshal(paymentBody, &payments); err != nil {
-		log.Println("GET /rentals, payments parsing error, ", err.Error())
-		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: "Payment parsing error"})
-		return
+	if err == nil && paymentStatus == http.StatusOK && len(paymentBody) > 2 && string(paymentBody) != "{}" {
+		if err := json.Unmarshal(paymentBody, &payments); err != nil {
+			log.Println("GET /rentals, payments parsing error, ", err.Error())
+			payments = nil // Будем использовать fallback
+		}
 	}
 	
 	// 4. Смэтчить в массив RentalResponse
 	carMap := make(map[string]models.CarInfo)
-    for _, car := range cars {
-        carMap[car.CarUID] = models.CarInfo{
-			CarUID: car.CarUID,
-			Brand: car.Brand,
-			Model: car.Model,
-			RegistrationNumber: car.RegistrationNumber,
+	if cars != nil {
+		for _, car := range cars {
+			carMap[car.CarUID] = models.CarInfo{
+				CarUID:            car.CarUID,
+				Brand:             car.Brand,
+				Model:             car.Model,
+				RegistrationNumber: car.RegistrationNumber,
+			}
 		}
-    }
+	}
+
+	for _, rental := range rentals {
+		if _, exists := carMap[rental.CarUID]; !exists {
+			carMap[rental.CarUID] = models.CarInfo{CarUID: rental.CarUID}
+		}
+	}
 
     paymentMap := make(map[string]models.PaymentInfo)
-    for _, payment := range payments {
-        paymentMap[payment.PaymentUID] = payment
-    }
+	if payments != nil {
+		for _, payment := range payments {
+			paymentMap[payment.PaymentUID] = payment
+		}
+	}
+
+	for _, rental := range rentals {
+		if _, exists := paymentMap[rental.PaymentUID]; !exists {
+			paymentMap[rental.PaymentUID] = models.PaymentInfo{PaymentUID: rental.PaymentUID}
+		}
+	}
 
 	rentalsResponse := make([]models.RentalResponse, len(rentals))
 
@@ -190,11 +282,11 @@ func (h *GatewayHandler) GetRentalById(ctx *gin.Context) {
 
 	rentalUrl := h.config.RentalUrl + "/rental/" + rentalUid
 	
-	status, body, _, err := forwardRequest(ctx, "GET", rentalUrl, headers, nil)
+	status, body, _, err := h.forwardRequestWithCB(ctx, "GET", rentalUrl, headers, nil, h.rentalCB, true)
 
 	if err != nil {
 		log.Println("GET /rental/:id, can't get rental with id = " + rentalUid + ", ", err.Error())
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
+		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{ Message: "Rental Service unavailable" })
 		return
 	}
 
@@ -214,54 +306,60 @@ func (h *GatewayHandler) GetRentalById(ctx *gin.Context) {
 	// Получить авто
 	carUrl := h.config.CarUrl + "/cars/" + rental.CarUID
 
-	carStatus, carBody, _, err := forwardRequest(ctx, "GET", carUrl, nil, nil)
-	if err != nil {
-		log.Println("GET /rental/:id, can't get car with uid = " + rental.CarUID + " ", err.Error())
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
-		return
-	}
+	carStatus, carBody, _, err := h.forwardRequestWithCB(ctx, "GET", carUrl, nil, nil, h.carCB, false)
+	// if err != nil {
+	// 	log.Println("GET /rental/:id, can't get car with uid = " + rental.CarUID + " ", err.Error())
+	// 	ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
+	// 	return
+	// }
 
-	if carStatus != http.StatusOK {
+	// TODO: уточнить
+	if carStatus != http.StatusOK && err == nil {
 		log.Println("GET /rental/:id, car getting error with uid = " + rental.CarUID + " ")
 		ctx.Data(carStatus, "application/json", carBody)
 		return
 	}
 
-	var carResponse models.ShortCarResponse
-	if err := json.Unmarshal(carBody, &carResponse); err != nil {
-		log.Println("GET /rental/:id, car parsing error with uid = " + rental.CarUID + " ")
-		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: "Car parsing error"})
-		return
-	}
-
-	car := models.CarInfo{
-		CarUID: carResponse.CarUID,
-		Brand: carResponse.Brand,
-		Model: carResponse.Model,
-		RegistrationNumber: carResponse.RegistrationNumber,
+	var car models.CarInfo
+	if err == nil && carStatus == http.StatusOK && len(carBody) > 2 && string(carBody) != "{}" {
+		var carResponse models.ShortCarResponse
+		if err := json.Unmarshal(carBody, &carResponse); err == nil {
+			car = models.CarInfo{
+				CarUID:            carResponse.CarUID,
+				Brand:             carResponse.Brand,
+				Model:             carResponse.Model,
+				RegistrationNumber: carResponse.RegistrationNumber,
+			}
+		} else {
+			car = models.CarInfo{CarUID: rental.CarUID}
+		}
+	} else {
+		car = models.CarInfo{CarUID: rental.CarUID}
 	}
 	
 	// Получить оплату
 	paymentUrl := h.config.PaymentUrl + "/payment/" + rental.PaymentUID
 
-	paymentStatus, paymentBody, _, err := forwardRequest(ctx, "GET", paymentUrl, nil, nil)
-	if err != nil {
-		log.Println("GET /rental/:id, can't get payment with with uid = " + rental.PaymentUID + " ", err.Error())
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
-		return
-	}
+	paymentStatus, paymentBody, _, err := h.forwardRequestWithCB(ctx, "GET", paymentUrl, nil, nil, h.paymentCB, false)
+	// if err != nil {
+	// 	log.Println("GET /rental/:id, can't get payment with with uid = " + rental.PaymentUID + " ", err.Error())
+	// 	ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
+	// 	return
+	// }
 
-	if paymentStatus != http.StatusOK {
+	if paymentStatus != http.StatusOK && err == nil {
 		log.Println("GET /rental/:id, payment getting error with with uid = " + rental.CarUID + " ")
 		ctx.Data(paymentStatus, "application/json", paymentBody)
 		return
 	}
 
 	var payment models.PaymentInfo
-	if err := json.Unmarshal(paymentBody, &payment); err != nil {
-		log.Println("GET /rental/:id, payment parsing error with with uid = " + rental.CarUID + " ")
-		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: "Payment parsing error"})
-		return
+	if err == nil && paymentStatus == http.StatusOK && len(paymentBody) > 2 && string(paymentBody) != "{}" {
+		if err := json.Unmarshal(paymentBody, &payment); err != nil {
+			payment = models.PaymentInfo{PaymentUID: rental.PaymentUID}
+		}
+	} else {
+		payment = models.PaymentInfo{PaymentUID: rental.PaymentUID}
 	}
 
 	response := converters.ConvertToRentalResponse(rental, car, payment)
@@ -299,7 +397,7 @@ func (h *GatewayHandler) RentCar(ctx *gin.Context) {
 	carStatus, carBody, _, err := forwardRequest(ctx, "GET", checkCarUrl, nil, nil)
 	if err != nil {
 		log.Println("POST /rental, can't get car with uid = " + rentReq.CarUID + " ", err.Error())
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
+		ctx.JSON(http.StatusServiceUnavailable, models.ErrorResponse{ Message: "Car Service unavailable" })
 		return
 	}
 
@@ -340,7 +438,7 @@ func (h *GatewayHandler) RentCar(ctx *gin.Context) {
 
 	if err != nil {
 		log.Println("POST /rental, can't update car with uid = " + rentReq.CarUID + " ", err.Error())
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
+		ctx.JSON(http.StatusServiceUnavailable, models.ErrorResponse{ Message: "Car Service unavailable" })
 		return
 	}
 
@@ -367,12 +465,14 @@ func (h *GatewayHandler) RentCar(ctx *gin.Context) {
 
 	if err != nil {
 		log.Println("POST /rental, can't create payment, ", err.Error())
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
+		h.rollbackCarBooking(ctx, rentReq.CarUID) // TODO: Queue
+		ctx.JSON(http.StatusServiceUnavailable, models.ErrorResponse{Message: "Payment Service unavailable"})
 		return
 	}
 
 	if payStatus != http.StatusOK {
 		log.Println("POST /rental, payment creation error")
+		h.rollbackCarBooking(ctx, rentReq.CarUID) // TODO: Queue
 		ctx.Data(payStatus, "application/json", payBody)
 		return
 	}
@@ -381,6 +481,7 @@ func (h *GatewayHandler) RentCar(ctx *gin.Context) {
 
 	if err := json.Unmarshal(payBody, &paymentResponse); err != nil {
 		log.Println("POST /rental, payment parsing, ", err.Error())
+		h.rollbackCarBooking(ctx, rentReq.CarUID) // TODO: Queue
 		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: "Payment response parsing error"})
 		return
 	}
@@ -397,6 +498,8 @@ func (h *GatewayHandler) RentCar(ctx *gin.Context) {
 
 	if err != nil {
 		log.Println("POST /rental, rental marshaling error, ", err.Error())
+		h.rollbackCarBooking(ctx, rentReq.CarUID) // TODO: Queue
+		h.rollbackPayment(ctx, paymentResponse.PaymentUID) // TODO: Queue
 		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: "Rental Creation request marshaling error"})
 		return
 	}
@@ -405,12 +508,16 @@ func (h *GatewayHandler) RentCar(ctx *gin.Context) {
 
 	if err != nil {
 		log.Println("POST /rental, can't create rental, ", err.Error())
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
+		h.rollbackCarBooking(ctx, rentReq.CarUID) // TODO: Queue
+		h.rollbackPayment(ctx, paymentResponse.PaymentUID) // TODO: Queue
+		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: err.Error()})
 		return
 	}
 
 	if rentStatus != http.StatusOK {
 		log.Println("POST /rental, rental creation error")
+		h.rollbackCarBooking(ctx, rentReq.CarUID) // TODO: Queue
+		h.rollbackPayment(ctx, paymentResponse.PaymentUID) // TODO: Queue
 		ctx.Data(rentStatus, "application/json", rentBody)
 		return
 	}
@@ -450,7 +557,7 @@ func (h *GatewayHandler) FinishCarRent(ctx *gin.Context) {
 
 	if err != nil {
 		log.Println("POST /rental/:id/finish, can't get rental with id = " + rentalUid + ", ", err.Error())
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
+		ctx.JSON(http.StatusServiceUnavailable, models.ErrorResponse{Message: "Rental Service unavailable"})
 		return
 	}
 
@@ -469,7 +576,35 @@ func (h *GatewayHandler) FinishCarRent(ctx *gin.Context) {
 
 	if rental.Status != "IN_PROGRESS" {
 		log.Println("POST /rental/:id/finish, rental with id = ", rental.RentalUID, " is not active")
-		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: "Rental with id = " + rental.RentalUID + " is not active"})
+		ctx.JSON(http.StatusBadRequest, models.ErrorResponse{Message: "Rental with id = " + rental.RentalUID + " is not active"})
+		return
+	}
+
+	carStatusUpsert := models.CarStatusUpsert{
+		Availability: true,
+	}
+
+	carStatusBytes, err := json.Marshal(carStatusUpsert)
+
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: "Car upsert marshalling error"})
+		return
+	}
+
+	carUrl := h.config.CarUrl + "/cars/" + rental.CarUID
+
+	carStatus, carBody, _, err := forwardRequest(ctx, "PATCH", carUrl, nil, carStatusBytes)
+	if err != nil {
+		queue.EnqueueRetry(queue.RetryRequest{
+			Method:  "PATCH",
+			URL:    carUrl,
+			Headers: nil,
+			Body:    carStatusBytes,
+		})
+	}
+
+	if carStatus != http.StatusOK {
+		ctx.Data(carStatus, "application/json", carBody)
 		return
 	}
 
@@ -489,7 +624,7 @@ func (h *GatewayHandler) FinishCarRent(ctx *gin.Context) {
 	status, rentBody, _, err := forwardRequest(ctx, "PATCH", rentalUrl, headers, rentalBytes)
 
 	if err != nil {
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
+		ctx.JSON(http.StatusServiceUnavailable, models.ErrorResponse{Message: "Rental Service unavailable"})
 		return
 	}
 
@@ -502,30 +637,6 @@ func (h *GatewayHandler) FinishCarRent(ctx *gin.Context) {
 
 	if err := json.Unmarshal(rentBody, &rentalResponse); err != nil {
 		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: "Rental Deletion response parsing error"})
-		return
-	}
-
-	carStatusUpsert := models.CarStatusUpsert{
-		Availability: true,
-	}
-
-	carStatusBytes, err := json.Marshal(carStatusUpsert)
-
-	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: "Car upsert marshalling error"})
-		return
-	}
-
-	carUrl := h.config.CarUrl + "/cars/" + rentalResponse.CarUID
-
-	carStatus, carBody, _, err := forwardRequest(ctx, "PATCH", carUrl, nil, carStatusBytes)
-	if err != nil {
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
-		return
-	}
-
-	if carStatus != http.StatusOK {
-		ctx.Data(carStatus, "application/json", carBody)
 		return
 	}
 
@@ -554,7 +665,7 @@ func (h *GatewayHandler) RevokeRent(ctx *gin.Context) {
 
 	if err != nil {
 		log.Println("DELETE /rental/:id, can't get rental with id = " + rentalUid + ", ", err.Error())
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
+		ctx.JSON(http.StatusServiceUnavailable, models.ErrorResponse{Message: "Rental Service unavailable"})
 		return
 	}
 
@@ -573,39 +684,7 @@ func (h *GatewayHandler) RevokeRent(ctx *gin.Context) {
 
 	if rental.Status != "IN_PROGRESS" {
 		log.Println("DELETE /rental/:id, rental with id = ", rental.RentalUID, " is not active")
-		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: "Rental with id = " + rental.RentalUID + " is not active"})
-		return
-	}
-
-	rentalReq := models.RentalUpsert{
-		Status: "CANCELED",
-	}
-
-	rentalBytes, err := json.Marshal(rentalReq)
-
-	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: "Payment Creation request marshaling error"})
-		return
-	}
-
-	rentalUrl := h.config.RentalUrl + "/rental/" + rentalUid
-	
-	status, rentBody, _, err := forwardRequest(ctx, "PATCH", rentalUrl, headers, rentalBytes)
-
-	if err != nil {
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
-		return
-	}
-
-	if status != http.StatusOK {
-		ctx.Data(status, "application/json", rentBody)
-		return
-	}
-
-	var rentalResponse models.RentalInfo
-
-	if err := json.Unmarshal(rentBody, &rentalResponse); err != nil {
-		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: "Rental Deletion response parsing error"})
+		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: "Rental with id = " + rental.RentalUID + " is not active"})
 		return
 	}
 
@@ -620,16 +699,53 @@ func (h *GatewayHandler) RevokeRent(ctx *gin.Context) {
 		return
 	}
 
-	carUrl := h.config.CarUrl + "/cars/" + rentalResponse.CarUID
+	carUrl := h.config.CarUrl + "/cars/" + rental.CarUID
 
-	carStatus, carBody, _, err := forwardRequest(ctx, "PATCH", carUrl, nil, carStatusBytes)
+	carStatus, _, _, err := forwardRequest(ctx, "PATCH", carUrl, nil, carStatusBytes)
+
+	if err != nil || carStatus != http.StatusOK {
+		queue.EnqueueRetry(queue.RetryRequest{
+			Method:  "PATCH",
+			URL:     carUrl,
+			Headers: nil,
+			Body:    carStatusBytes,
+		})
+		log.Printf("Car upsert queued for retry: %s", rentalUid)
+	}
+
+	rentalReq := models.RentalUpsert{
+		Status: "CANCELED",
+	}
+
+	rentalBytes, err := json.Marshal(rentalReq)
+
 	if err != nil {
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
+		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: "Rental request marshaling error"})
 		return
 	}
 
-	if carStatus != http.StatusOK {
-		ctx.Data(carStatus, "application/json", carBody)
+	rentalUrl := h.config.RentalUrl + "/rental/" + rentalUid
+	
+	status, rentBody, _, err := forwardRequest(ctx, "PATCH", rentalUrl, headers, rentalBytes)
+
+	if err != nil {
+		queue.EnqueueRetry(queue.RetryRequest{
+			Method:  "PATCH",
+			URL:    rentalUrl,
+			Headers: headers,
+			Body:    rentalBytes,
+		})
+	}
+
+	if status != http.StatusOK {
+		ctx.Data(status, "application/json", rentBody)
+		return
+	}
+
+	var rentalResponse models.RentalInfo
+
+	if err := json.Unmarshal(rentBody, &rentalResponse); err != nil {
+		ctx.JSON(http.StatusInternalServerError, models.ErrorResponse{Message: "Rental Deletion response parsing error"})
 		return
 	}
 
@@ -648,8 +764,12 @@ func (h *GatewayHandler) RevokeRent(ctx *gin.Context) {
 
 	paymentStatus, paymentBody, _, err := forwardRequest(ctx, "PATCH", paymentUrl, nil, paymentStatusBytes)
 	if err != nil {
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: err.Error()})
-		return
+		queue.EnqueueRetry(queue.RetryRequest{
+			Method:  	"PATCH",
+			URL:    	paymentUrl,
+			Headers: 	nil,
+			Body:    	paymentStatusBytes,
+		})
 	}
 
 	if paymentStatus != http.StatusOK {
