@@ -593,19 +593,14 @@ func (h *GatewayHandler) FinishCarRent(ctx *gin.Context) {
 
 	carUrl := h.config.CarUrl + "/cars/" + rental.CarUID
 
-	carStatus, carBody, _, err := forwardRequest(ctx, "PATCH", carUrl, nil, carStatusBytes)
-	if err != nil {
+	carStatus, _, _, err := forwardRequest(ctx, "PATCH", carUrl, nil, carStatusBytes)
+	if err != nil || carStatus != http.StatusOK {
 		queue.EnqueueRetry(queue.RetryRequest{
 			Method:  "PATCH",
 			URL:    carUrl,
 			Headers: nil,
 			Body:    carStatusBytes,
 		})
-	}
-
-	if carStatus != http.StatusOK {
-		ctx.Data(carStatus, "application/json", carBody)
-		return
 	}
 
 	rentalReq := models.RentalUpsert{
@@ -623,14 +618,13 @@ func (h *GatewayHandler) FinishCarRent(ctx *gin.Context) {
 	
 	status, rentBody, _, err := forwardRequest(ctx, "PATCH", rentalUrl, headers, rentalBytes)
 
-	if err != nil {
-		ctx.JSON(http.StatusServiceUnavailable, models.ErrorResponse{Message: "Rental Service unavailable"})
-		return
-	}
-
-	if status != http.StatusOK {
-		ctx.Data(status, "application/json", rentBody)
-		return
+	if err != nil || status != http.StatusOK {
+		queue.EnqueueRetry(queue.RetryRequest{
+			Method:  "PATCH",
+			URL:    rentalUrl,
+			Headers: headers,
+			Body:    rentalBytes,
+		})
 	}
 
 	var rentalResponse models.RentalInfo
@@ -684,7 +678,7 @@ func (h *GatewayHandler) RevokeRent(ctx *gin.Context) {
 
 	if rental.Status != "IN_PROGRESS" {
 		log.Println("DELETE /rental/:id, rental with id = ", rental.RentalUID, " is not active")
-		ctx.JSON(http.StatusBadGateway, models.ErrorResponse{Message: "Rental with id = " + rental.RentalUID + " is not active"})
+		ctx.JSON(http.StatusBadRequest, models.ErrorResponse{Message: "Rental with id = " + rental.RentalUID + " is not active"})
 		return
 	}
 
@@ -728,18 +722,13 @@ func (h *GatewayHandler) RevokeRent(ctx *gin.Context) {
 	
 	status, rentBody, _, err := forwardRequest(ctx, "PATCH", rentalUrl, headers, rentalBytes)
 
-	if err != nil {
+	if err != nil || status != http.StatusOK  {
 		queue.EnqueueRetry(queue.RetryRequest{
 			Method:  "PATCH",
 			URL:    rentalUrl,
 			Headers: headers,
 			Body:    rentalBytes,
 		})
-	}
-
-	if status != http.StatusOK {
-		ctx.Data(status, "application/json", rentBody)
-		return
 	}
 
 	var rentalResponse models.RentalInfo
@@ -762,19 +751,14 @@ func (h *GatewayHandler) RevokeRent(ctx *gin.Context) {
 
 	paymentUrl := h.config.PaymentUrl + "/payment/" + rentalResponse.PaymentUID
 
-	paymentStatus, paymentBody, _, err := forwardRequest(ctx, "PATCH", paymentUrl, nil, paymentStatusBytes)
-	if err != nil {
+	paymentStatus, _, _, err := forwardRequest(ctx, "PATCH", paymentUrl, nil, paymentStatusBytes)
+	if err != nil || paymentStatus != http.StatusOK {
 		queue.EnqueueRetry(queue.RetryRequest{
 			Method:  	"PATCH",
 			URL:    	paymentUrl,
 			Headers: 	nil,
 			Body:    	paymentStatusBytes,
 		})
-	}
-
-	if paymentStatus != http.StatusOK {
-		ctx.Data(paymentStatus, "application/json", paymentBody)
-		return
 	}
 
 	ctx.Status(http.StatusNoContent)
