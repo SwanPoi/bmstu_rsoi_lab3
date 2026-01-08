@@ -23,9 +23,9 @@ func NewHandler(services *services.Services, config *models.HandlerConfig) *Gate
 	return &GatewayHandler{
 		services: services,
 		config: config,
-		carCB:     cb.NewCircuitBreaker(3, 30*time.Second, 5 * time.Minute),
-		rentalCB:  cb.NewCircuitBreaker(3, 30*time.Second, 5 * time.Minute),
-		paymentCB: cb.NewCircuitBreaker(3, 30*time.Second, 5 * time.Minute),
+		carCB:     cb.NewCircuitBreaker(5, 0.4, 30*time.Second),
+		rentalCB:  cb.NewCircuitBreaker(5, 0.4, 30*time.Second),
+		paymentCB: cb.NewCircuitBreaker(5, 0.4, 30*time.Second),
 	}
 }
 

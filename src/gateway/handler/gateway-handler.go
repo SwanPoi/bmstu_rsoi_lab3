@@ -62,9 +62,10 @@ func (h *GatewayHandler) forwardRequestWithCB(
 
 	if !cb.AllowRequest() {
 		if isCritical {
+			log.Println(targetURL + " is unavailable (critical)")
 			return 0, nil, nil, fmt.Errorf(targetURL + " is unavailable")
 		}
-
+		log.Println(targetURL + " is unavailable (not critical)")
 		return http.StatusOK, []byte("{}"), nil, nil
 	}
 

@@ -12,22 +12,22 @@ const (
 	StateHalfOpen = "half-open"
 )
 
+// TODO: переделать под циклический массив
 type CircuitBreaker struct {
 	mu					sync.RWMutex
 	State 				string
-	FailuresQty			int
-	MaxFailures			int
-	LastFailureTime		time.Time
-	ResetTimeout		time.Duration
+	RingBuffer			*RingBuffer
+	FailureRate			float64
+	LastRequestTime		time.Time
 	Timeout				time.Duration
 }
 
-func NewCircuitBreaker(maxFailures int, timeout, resetTimeout time.Duration) *CircuitBreaker {
+func NewCircuitBreaker(bufferSize int, failureRate float64, timeout time.Duration) *CircuitBreaker {
 	return &CircuitBreaker{
-		State:        StateClosed,
-		MaxFailures:  maxFailures,
-		Timeout:      timeout,
-		ResetTimeout: resetTimeout,
+		State:        	StateClosed,
+		RingBuffer: 	NewRingBuffer(bufferSize),
+		FailureRate: 	failureRate,
+		Timeout:      	timeout,
 	}
 }
 
@@ -39,7 +39,7 @@ func (cb *CircuitBreaker) AllowRequest() bool {
 		case StateClosed:
 			return true
 		case StateOpen:
-			if time.Since(cb.LastFailureTime) >= cb.Timeout {
+			if time.Since(cb.LastRequestTime) >= cb.Timeout {
 				cb.State = StateHalfOpen
 				return true
 			}
@@ -55,12 +55,16 @@ func (cb *CircuitBreaker) RecordSuccess() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
+	cb.RingBuffer.Add(RequestResult{Success: true, Time: time.Now()})
+
 	if cb.State == StateHalfOpen {
 		cb.State = StateClosed
 	}
 
-	if time.Since(cb.LastFailureTime) >= cb.ResetTimeout {
-		cb.FailuresQty = 0
+	if cb.State == StateClosed && cb.RingBuffer.GetFailureRate() <= cb.FailureRate {
+	} else if cb.State == StateClosed && cb.RingBuffer.GetFailureRate() > cb.FailureRate {
+		cb.State = StateOpen
+		cb.LastRequestTime = time.Now()
 	}
 }
 
@@ -68,15 +72,17 @@ func (cb *CircuitBreaker) RecordFailure() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	cb.FailuresQty++
-	cb.LastFailureTime = time.Now()
-
-	if cb.FailuresQty >= cb.MaxFailures {
-		cb.State = StateOpen
-	}
-
+	cb.RingBuffer.Add(RequestResult{Success: false, Time: time.Now()})
+	
 	if cb.State == StateHalfOpen {
 		cb.State = StateOpen
+		cb.LastRequestTime = time.Now()
+		return
+	}
+	
+	if cb.State == StateClosed && cb.RingBuffer.GetFailureRate() > cb.FailureRate {
+		cb.State = StateOpen
+		cb.LastRequestTime = time.Now()
 	}
 }
 
@@ -95,4 +101,8 @@ func (cb *CircuitBreaker) Execute(operation func() error, fallback func()) error
 
     cb.RecordSuccess()
     return nil
+}
+
+func (cb *CircuitBreaker) GetFailureRate() float64 {
+	return cb.RingBuffer.GetFailureRate()
 }
